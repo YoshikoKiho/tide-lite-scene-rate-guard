@@ -1,0 +1,6 @@
+id=scene_rate_guard
+name=潮汐 Lite · Scene Rate Guard
+version=1.0.0
+versionCode=1
+author=DSH
+description=只守护 sugov_ext 的 up/down rate_limit_us，不碰 governor 与频率。支持 Scene 省电/均衡/性能预设、插拔电源与 2 秒自动回写、液态玻璃外观。

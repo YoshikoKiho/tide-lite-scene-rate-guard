@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#e9efe9">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect width='48' height='48' rx='14' fill='%23d9e5e0'/%3E%3Cg fill='none' stroke='%233f5d58' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='24' cy='24' r='14'/%3E%3Cpath d='M11 27c4-5 8-5 12 0s8 5 14 0M11 20c4-5 8-5 12 0s8 5 14 0'/%3E%3C/g%3E%3C/svg%3E">
+  <title>潮汐 Lite · Scene Rate Guard</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body data-theme="lily" data-wallpaper="garden" data-font="serif">
+  <div class="wallpaper" aria-hidden="true">
+    <div class="custom-wall" id="customWall"></div>
+    <div class="wash"></div>
+    <div class="wallpaper-art"></div>
+    <div class="glass-specular" aria-hidden="true"></div>
+    <div class="grain"></div>
+  </div>
+
+  <main class="shell">
+    <header class="topbar">
+      <a class="brand" href="#" aria-label="潮汐 Lite 首页">
+        <span class="brand-mark">
+          <svg viewBox="0 0 48 48" aria-hidden="true">
+            <circle cx="24" cy="24" r="20.5"></circle>
+            <path d="M11 27.5c4.2-5.6 8.1-5.6 12.3 0 4.2 5.6 8.1 5.6 13.7 0"></path>
+            <path d="M11 20.5c4.2-5.6 8.1-5.6 12.3 0 4.2 5.6 8.1 5.6 13.7 0"></path>
+          </svg>
+        </span>
+        <span class="brand-text">
+          <span class="eyebrow">SCENE · RATE LIMIT</span>
+          <span class="brand-name">潮汐 Lite</span>
+        </span>
+      </a>
+      <div class="top-actions">
+        <span class="pill" id="guardPill"><i class="dot"></i><span>连接中</span></span>
+        <button class="icon-button" id="settingsButton" type="button" aria-label="外观与诊断">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 7h9M17 7h3M4 17h3M11 17h9"></path>
+            <circle cx="15" cy="7" r="2.2"></circle>
+            <circle cx="9" cy="17" r="2.2"></circle>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="demo-banner" id="demoBanner" hidden>
+      <span>预览模式</span>
+      未连接 KernelSU，参数只会保存在本页。
+    </div>
+
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">ONLY RATE LIMIT · NO GOVERNOR · NO FREQUENCY</p>
+        <h1>只守住，<br><span>Scene 的节奏。</span></h1>
+        <p class="hero-lede">
+          只写三簇 <code>up_rate_limit_us</code> 与 <code>down_rate_limit_us</code>。
+          不碰 governor，不碰频率上下限，不再把功耗抬高。
+        </p>
+        <div class="hero-tags">
+          <span>天玑 9400+</span>
+          <span>2s GUARD</span>
+          <span>SCENE READY</span>
+        </div>
+      </div>
+      <div class="orbit" aria-hidden="true">
+        <span class="orbit-ring"></span>
+        <span class="orbit-ring orbit-ring-2"></span>
+        <span class="orbit-core"><b id="heroValue">—</b><small>µs</small></span>
+        <span class="orbit-caption">steady tide</span>
+      </div>
+    </section>
+
+    <section class="status-strip" aria-label="运行状态">
+      <div class="status-cell">
+        <span class="status-icon">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M5 8l7-5 7 5M5 16l7 5 7-5"></path></svg>
+        </span>
+        <span><small>守护</small><b id="guardText">连接中</b></span>
+      </div>
+      <div class="status-cell">
+        <span class="status-icon">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h10v10H7z"></path><path d="M9 3v4M15 3v4M9 17v4M15 17v4"></path></svg>
+        </span>
+        <span><small>电源</small><b id="chargeText">检测中</b></span>
+      </div>
+      <div class="status-cell">
+        <span class="status-icon">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 1 0 2.3-5.7"></path><path d="M4 4v5h5"></path></svg>
+        </span>
+        <span><small>最近校准</small><b id="syncText">—</b></span>
+      </div>
+    </section>
+
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">PER-CLUSTER RATE LIMIT</p>
+        <h2>三簇限幅</h2>
+      </div>
+      <button class="mini-toggle" id="syncToggle" type="button" aria-pressed="false">
+        <span class="switch-dot"></span>同步三簇
+      </button>
+    </div>
+
+    <section class="cluster-grid" id="clusterGrid" aria-live="polite">
+      <div class="cluster-skeleton"></div>
+      <div class="cluster-skeleton"></div>
+      <div class="cluster-skeleton"></div>
+    </section>
+
+    <section class="scene-card" id="sceneCard" hidden>
+      <div class="scene-head">
+        <div>
+          <p class="eyebrow">FROM SCENE PROFILE</p>
+          <h2>Scene 方案</h2>
+        </div>
+        <button type="button" class="text-button" id="sceneReload">重新读取</button>
+      </div>
+      <div class="scene-presets" id="scenePresets"></div>
+      <p class="scene-hint" id="sceneHint">从 Scene 的 profile.json 读取限幅值，点一下填入，再应用。</p>
+    </section>
+
+    <p class="fineprint">
+      范围 <b>0–20000 µs</b>。目标值会同时写入该簇的 <code>up_rate_limit_us</code> 与
+      <code>down_rate_limit_us</code>；守护进程每 2 秒比对一次，插拔电源后立即 3 连写。
+      不修改 governor、min_freq、max_freq。
+    </p>
+
+    <footer class="site-footer">
+      <span>潮汐 Lite <b>v1.0</b></span>
+      <span id="deviceLine">等待设备信息</span>
+    </footer>
+  </main>
+
+  <div class="action-bar">
+    <div class="action-inner">
+      <div class="action-copy">
+        <b id="dirtyLabel">参数已同步</b>
+        <span>只覆盖 rate limit；电源事件后自动回写</span>
+      </div>
+      <div class="action-buttons">
+        <button class="button button-ghost" id="pauseButton" type="button">暂停守护</button>
+        <button class="button button-primary" id="applyButton" type="button">
+          <span>应用并守护</span>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h13M13 6l6 6-6 6"></path></svg>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <div class="sheet" id="sheet" aria-hidden="true">
+    <div class="sheet-scrim" data-close="sheet"></div>
+    <section class="sheet-panel" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
+      <div class="grabber" aria-hidden="true"></div>
+      <header class="sheet-head">
+        <div>
+          <p class="eyebrow">APPEARANCE &amp; DIAGNOSTICS</p>
+          <h2 id="sheetTitle">外观与诊断</h2>
+        </div>
+        <button class="icon-button" type="button" data-close="sheet" aria-label="关闭">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"></path></svg>
+        </button>
+      </header>
+
+      <div class="sheet-content">
+        <section class="setting-group">
+          <div class="setting-title"><h3>色彩</h3><span>莫奈 · 液态玻璃</span></div>
+          <div class="theme-grid" id="themeGrid">
+            <button type="button" class="theme-option" data-theme="lily">
+              <span class="swatch swatch-lily"><i></i><i></i><i></i></span><span>睡莲</span>
+            </button>
+            <button type="button" class="theme-option" data-theme="sage">
+              <span class="swatch swatch-sage"><i></i><i></i><i></i></span><span>鼠尾草</span>
+            </button>
+            <button type="button" class="theme-option" data-theme="rose">
+              <span class="swatch swatch-rose"><i></i><i></i><i></i></span><span>雾玫瑰</span>
+            </button>
+            <button type="button" class="theme-option" data-theme="wheat">
+              <span class="swatch swatch-wheat"><i></i><i></i><i></i></span><span>麦田</span>
+            </button>
+            <button type="button" class="theme-option" data-theme="dusk">
+              <span class="swatch swatch-dusk"><i></i><i></i><i></i></span><span>暮霭</span>
+            </button>
+            <button type="button" class="theme-option" data-theme="glass">
+              <span class="swatch swatch-glass"><i></i><i></i><i></i></span><span>液态玻璃</span>
+            </button>
+          </div>
+        </section>
+
+        <section class="setting-group">
+          <div class="setting-title"><h3>壁纸</h3><span>内置 · 可上传</span></div>
+          <div class="wallpaper-grid" id="wallpaperGrid">
+            <button type="button" class="wall-option wall-garden" data-wallpaper="garden"><span>晨雾花园</span></button>
+            <button type="button" class="wall-option wall-water" data-wallpaper="water"><span>睡莲池</span></button>
+            <button type="button" class="wall-option wall-linen" data-wallpaper="linen"><span>亚麻纸</span></button>
+            <button type="button" class="wall-option wall-plain" data-wallpaper="plain"><span>留白</span></button>
+            <button type="button" class="wall-option wall-custom" data-wallpaper="custom" id="customWallButton"><span>我的照片</span></button>
+          </div>
+          <div class="upload-row">
+            <label class="upload-button">
+              <input type="file" id="wallpaperUpload" accept="image/*">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4M7 9l5-5 5 5M5 15v4h14v-4"></path></svg>
+              上传壁纸
+            </label>
+            <button type="button" class="text-button" id="clearWallpaper">移除照片</button>
+          </div>
+        </section>
+
+        <section class="setting-group">
+          <div class="setting-title"><h3>字体</h3><span>系统字体栈</span></div>
+          <div class="font-grid" id="fontGrid">
+            <button type="button" data-font="serif"><b>文楷</b><span>柔和手写感</span></button>
+            <button type="button" data-font="song"><b>素宋</b><span>清瘦宋体</span></button>
+            <button type="button" data-font="sans"><b>圆体</b><span>系统无衬线</span></button>
+            <button type="button" data-font="mono"><b>等宽</b><span>数字更整齐</span></button>
+          </div>
+        </section>
+
+        <section class="setting-group">
+          <div class="setting-title">
+            <h3>运行诊断</h3>
+            <button type="button" class="text-button" id="logToggle">查看日志</button>
+          </div>
+          <div class="diag-grid" id="diagGrid"></div>
+          <div class="node-list" id="nodeList"></div>
+          <pre class="log-box" id="logBox" hidden></pre>
+        </section>
+
+        <p class="about">
+          潮汐 Lite v1.0 · 只修改 `up/down_rate_limit_us`，不修改调频器或频率范围。
+          写入失败时日志会显示具体 policy。
+          <button type="button" class="text-button" id="resetLook">恢复默认外观</button>
+        </p>
+      </div>
+    </section>
+  </div>
+
+  <noscript><p class="noscript">请启用 JavaScript 以使用控制面板。</p></noscript>
+  <script src="app.js"></script>
+</body>
+</html>
