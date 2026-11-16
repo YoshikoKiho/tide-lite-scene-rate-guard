@@ -267,7 +267,7 @@ std::string get_prop(const char* name) {
 
 struct Config {
     bool enabled = true;
-    std::string mode = "passive"; // "passive" (default), "scene", "lock"
+    std::string mode = "smart"; // "smart" (default), "scene", "lock"
     int low_bat_threshold = 20;
     bool watch_charger = true;
     bool watch_screen = true;
@@ -783,8 +783,9 @@ bool write_scene_schemes(const Paths& paths, const std::vector<Cluster>& cluster
 }
 
 std::string normalize_mode(const std::string& v) {
-    if (v == "scene" || v == "lock" || v == "passive") return v;
-    return "passive";
+    if (v == "scene" || v == "lock" || v == "smart") return v;
+    // Upgrade legacy "passive" seamlessly to the fixed boost-exempt "smart" watcher
+    return "smart";
 }
 
 void load_config(const Paths& paths, const std::vector<Cluster>& clusters, Config& cfg) {
@@ -953,15 +954,53 @@ bool is_governor_rate_active(const std::string& gov) {
     return gov != "powersave" && gov != "performance" && gov != "conservative";
 }
 
+bool write_str_quiet(const char* path, const std::string& content) {
+    UniqueFd fd(::open(path, O_WRONLY | O_CLOEXEC));
+    if (!fd.valid()) return false;
+    ssize_t n = ::write(fd.get(), content.data(), content.size());
+    return n > 0;
+}
+
+void protect_daemon_process() {
+    if (::geteuid() != 0) return;
+    std::string pid_s = std::to_string(::getpid()) + "\n";
+    // Move out of caller app cgroup (e.g. KsuWebUI memcg/mimd) so LMK/freezer never kills daemon
+    write_str_quiet("/dev/memcg/cgroup.procs", pid_s);
+    write_str_quiet("/dev/cpuctl/cgroup.procs", pid_s);
+    write_str_quiet("/dev/cpuset/cgroup.procs", pid_s);
+    write_str_quiet("/dev/blkio/cgroup.procs", pid_s);
+    std::string v2_dir = "/sys/fs/cgroup/uid_0/pid_" + std::to_string(::getpid());
+    ::mkdir("/sys/fs/cgroup/uid_0", 0755);
+    ::mkdir(v2_dir.c_str(), 0755);
+    if (!write_str_quiet((v2_dir + "/cgroup.procs").c_str(), pid_s)) {
+        write_str_quiet("/sys/fs/cgroup/cgroup.procs", pid_s);
+    }
+    write_str_quiet("/proc/self/oom_score_adj", "-900\n");
+}
+
+void detach_daemon_stdio() {
+    ::setsid();
+    ::signal(SIGHUP, SIG_IGN);
+    ::signal(SIGPIPE, SIG_IGN);
+    UniqueFd devnull(::open("/dev/null", O_RDWR | O_CLOEXEC));
+    if (devnull.valid()) {
+        ::dup2(devnull.get(), STDIN_FILENO);
+        ::dup2(devnull.get(), STDOUT_FILENO);
+        ::dup2(devnull.get(), STDERR_FILENO);
+    }
+}
+
 bool enforce_clusters(const Config& cfg, std::vector<Cluster>& clusters,
                       State& st, Logger& log, const std::string& reason,
-                      bool force, bool count_as_fix = true) {
+                      bool force, bool count_as_fix = true, bool* out_wrote_any = nullptr) {
+    if (out_wrote_any) *out_wrote_any = false;
     if (!cfg.enabled) return true;
     bool all_ok = true;
     int64_t now_s = static_cast<int64_t>(time(nullptr));
     int64_t now_m = mono_ms();
-    bool relaxed_skip_boost = (!force && cfg.mode == "passive" &&
-                               (reason == "screen_on" || reason == "governor_restore" || reason == "boot_verify"));
+    bool skip_active_boost = (!force && cfg.mode != "lock" &&
+                              reason != "screen_off" && reason != "charger_unplug" &&
+                              reason != "low_battery" && reason != "boot");
 
     for (auto& c : clusters) {
         refresh_cluster_rate_paths(c);
@@ -976,8 +1015,8 @@ bool enforce_clusters(const Config& cfg, std::vector<Cluster>& clusters,
         bool got_up = read_uint(c.up_path, cur_up);
         bool got_dn = read_uint(c.dn_path, cur_dn);
 
-        // In passive mode on screen wake/boot verify, avoid fighting active transient PowerHAL boosts (0/6000)
-        if (relaxed_skip_boost && got_up && got_dn && cur_up == 0 && cur_dn == 6000 && want_up > 0) {
+        // Exempt active vendor boosts (up=0, e.g. 0/0 or 0/6000) to avoid fighting PowerHAL
+        if (skip_active_boost && got_up && cur_up == 0 && want_up > 0) {
             continue;
         }
 
@@ -988,6 +1027,7 @@ bool enforce_clusters(const Config& cfg, std::vector<Cluster>& clusters,
         bool changed = false;
         if (need_up) {
             if (write_uint_sysfs(c.up_path, want_up)) {
+                if (out_wrote_any) *out_wrote_any = true;
                 if (!got_up || cur_up != want_up) changed = true;
             } else {
                 all_ok = false;
@@ -995,6 +1035,7 @@ bool enforce_clusters(const Config& cfg, std::vector<Cluster>& clusters,
         }
         if (need_dn) {
             if (write_uint_sysfs(c.dn_path, want_dn)) {
+                if (out_wrote_any) *out_wrote_any = true;
                 if (!got_dn || cur_dn != want_dn) changed = true;
             } else {
                 all_ok = false;
@@ -1006,6 +1047,19 @@ bool enforce_clusters(const Config& cfg, std::vector<Cluster>& clusters,
                 st.last_fix_ts = now_s;
                 st.last_reason = reason;
                 st.dirty = true;
+                if (!force) {
+                    if (now_m - c.burst_start_ms > 4000) {
+                        c.burst_start_ms = now_m;
+                        c.burst_count = 1;
+                    } else {
+                        ++c.burst_count;
+                        if (c.burst_count > 3) {
+                            c.suppress_until_ms = now_m + 10000;
+                            c.burst_count = 0;
+                            log.write("cooldown 10s on " + c.policy_name + " (contention)");
+                        }
+                    }
+                }
             }
             log.write(std::string(count_as_fix ? "fix " : "apply ") +
                       c.policy_name + " (" + reason + ") " +
@@ -1032,6 +1086,9 @@ public:
             return 0;
         }
 
+        detach_daemon_stdio();
+        protect_daemon_process();
+
         // Write PID cleanly
         write_atomic_file(paths_.pid_file, std::to_string(::getpid()) + "\n", 0644);
 
@@ -1056,6 +1113,8 @@ public:
         clusters_ = discover_clusters(paths_);
         load_config(paths_, clusters_, cfg_);
         if (!file_exists(paths_.conf_file)) save_config(paths_, cfg_);
+        active_cfg_ = cfg_;
+        cached_schemes_ = parse_all_scene_schemes(paths_, clusters_);
         load_state(paths_, state_);
 
         init_local_tz_once();
@@ -1081,7 +1140,7 @@ public:
         // Boot enforcement + single settle check
         if (cfg_.enabled) {
             if (cfg_.mode == "scene" && !file_exists(paths_.conf_file)) sync_from_scene(false);
-            enforce_clusters(cfg_, clusters_, state_, log_, "boot", false, false);
+            run_enforce(active_target_cfg(), "boot", false, false);
             schedule_burst({3000}, "boot_verify");
         }
 
@@ -1196,7 +1255,16 @@ private:
         }
     }
 
-    void arm_cluster_watches(Cluster& c) {
+    void disarm_rate_watches() {
+        for (auto& c : clusters_) {
+            rm_watch(c.wd_up);
+            rm_watch(c.wd_dn);
+            c.wd_up_ino = 0;
+            c.wd_dn_ino = 0;
+        }
+    }
+
+    void arm_cluster_watches(Cluster& c, int64_t now_m) {
         if (c.wd_dir < 0) {
             c.wd_dir = ::inotify_add_watch(ino_fd_.get(), c.policy_dir.c_str(), IN_CREATE | IN_DELETE);
         }
@@ -1205,8 +1273,7 @@ private:
             c.wd_gov = ::inotify_add_watch(ino_fd_.get(), gpath.c_str(), IN_CLOSE_WRITE | IN_MODIFY);
         }
         refresh_cluster_rate_paths(c);
-        if (cfg_.mode != "lock") {
-            // Relaxed / Scene modes: never watch rate_limit_us continuously (avoid fighting PowerHAL boosts)
+        if (!cfg_.enabled || now_m < mute_rates_until_ms_) {
             rm_watch(c.wd_up);
             rm_watch(c.wd_dn);
             c.wd_up_ino = 0;
@@ -1240,6 +1307,7 @@ private:
     }
 
     void arm_watches() {
+        int64_t now_m = mono_ms();
         if (wd_data_dir_ < 0) {
             wd_data_dir_ = ::inotify_add_watch(ino_fd_.get(), paths_.data_dir.c_str(),
                                                IN_CLOSE_WRITE | IN_MOVED_TO);
@@ -1257,14 +1325,14 @@ private:
             rm_watch(wd_scene_dir_);
         }
         if (cfg_.watch_screen && !backlight_path_.empty()) {
-            if (wd_bl_ < 0 && mono_ms() >= bl_rearm_block_until_ms_) {
+            if (wd_bl_ < 0 && now_m >= bl_rearm_block_until_ms_) {
                 wd_bl_ = ::inotify_add_watch(ino_fd_.get(), backlight_path_.c_str(),
                                              IN_CLOSE_WRITE | IN_MODIFY);
             }
         } else {
             rm_watch(wd_bl_);
         }
-        for (auto& c : clusters_) arm_cluster_watches(c);
+        for (auto& c : clusters_) arm_cluster_watches(c, now_m);
     }
 
     void rearm_timerfd() {
@@ -1325,15 +1393,105 @@ private:
         return stamp > 0 && now_m >= stamp && (now_m - stamp) <= 3000;
     }
 
+    const Config& active_target_cfg() const {
+        return (cfg_.mode == "scene") ? active_cfg_ : cfg_;
+    }
+
+    void run_enforce(const Config& target, const std::string& reason, bool force, bool count_as_fix = true) {
+        bool wrote = false;
+        enforce_clusters(target, clusters_, state_, log_, reason, force, count_as_fix, &wrote);
+        if (wrote) {
+            // Suppress self-triggered inotify echoes from our own sysfs writes
+            suppress_rate_until_ms_ = mono_ms() + 80;
+        }
+    }
+
+    static bool scheme_differs(const SceneRates& a, const SceneRates& b, size_t nclusters) {
+        if (!a.found || !b.found) return false;
+        for (size_t i = 0; i < nclusters; ++i) {
+            if (a.has_up[i] && b.has_up[i] && a.up[i] != b.up[i]) return true;
+            if (a.has_dn[i] && b.has_dn[i] && a.dn[i] != b.dn[i]) return true;
+        }
+        return false;
+    }
+
+    bool maybe_latch_scene_scheme() {
+        if (cfg_.mode != "scene") return false;
+        const SceneRates* list[3] = {&cached_schemes_.powersave, &cached_schemes_.balance, &cached_schemes_.performance};
+        bool distinct = scheme_differs(*list[0], *list[1], clusters_.size()) ||
+                        scheme_differs(*list[1], *list[2], clusters_.size()) ||
+                        scheme_differs(*list[0], *list[2], clusters_.size());
+        if (!distinct) return false;
+
+        uint64_t cur_up[kMaxClusters] = {};
+        uint64_t cur_dn[kMaxClusters] = {};
+        bool got[kMaxClusters] = {};
+        for (size_t i = 0; i < clusters_.size(); ++i) {
+            refresh_cluster_rate_paths(clusters_[i]);
+            if (is_governor_rate_active(clusters_[i].governor) &&
+                !clusters_[i].up_path.empty() && !clusters_[i].dn_path.empty()) {
+                uint64_t u = 0, d = 0;
+                if (read_uint(clusters_[i].up_path, u) && read_uint(clusters_[i].dn_path, d)) {
+                    cur_up[i] = u;
+                    cur_dn[i] = d;
+                    got[i] = true;
+                }
+            }
+        }
+        for (const SceneRates* sr : list) {
+            if (!sr->found) continue;
+            bool match = true;
+            bool had_any = false;
+            for (size_t i = 0; i < clusters_.size(); ++i) {
+                if (!got[i]) continue;
+                if (!sr->has_up[i] || !sr->has_dn[i]) { match = false; break; }
+                if (cur_up[i] == 0 && sr->up[i] > 0) { match = false; break; }
+                if (cur_up[i] != sr->up[i] || cur_dn[i] != sr->dn[i]) { match = false; break; }
+                had_any = true;
+            }
+            if (match && had_any) {
+                for (size_t i = 0; i < clusters_.size(); ++i) {
+                    active_cfg_.up[i] = sr->up[i];
+                    active_cfg_.dn[i] = sr->dn[i];
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void schedule_rate_check(int delay_ms) {
+        int64_t now = mono_ms();
+        for (auto& t : timers_) {
+            if (t.reason == "rate_check") {
+                int64_t max_at = rate_check_first_ms_ + 360;
+                int64_t want_at = std::min(max_at, now + delay_ms);
+                if (want_at > t.at_ms) {
+                    t.at_ms = want_at;
+                    rearm_timerfd();
+                }
+                return;
+            }
+        }
+        rate_check_first_ms_ = now;
+        timers_.push_back({now + delay_ms, "rate_check"});
+        rearm_timerfd();
+    }
+
     void reload_config_and_apply(const std::string& reason) {
         Config prev = cfg_;
         load_config(paths_, clusters_, cfg_);
+        active_cfg_ = cfg_;
+        cached_schemes_ = parse_all_scene_schemes(paths_, clusters_);
+        for (auto& c : clusters_) {
+            c.suppress_until_ms = 0;
+            c.burst_count = 0;
+        }
+        mute_rates_until_ms_ = 0;
+        rate_burst_count_ = 0;
         arm_watches();
         if (cfg_.enabled) {
-            enforce_clusters(cfg_, clusters_, state_, log_, reason, false, false);
-            if (cfg_.mode != "passive") {
-                schedule_burst({600}, reason + "_verify");
-            }
+            run_enforce(active_target_cfg(), reason, false, false);
         } else if (prev.enabled && !cfg_.enabled) {
             timers_.clear();
             rearm_timerfd();
@@ -1349,8 +1507,11 @@ private:
         bool need_rearm = false;
         bool gov_event = false;
         bool dir_recreated = false;
-        std::vector<int> touched_rates;
+        bool rate_touched = false;
         std::vector<int> touched_govs;
+
+        int64_t now_m = mono_ms();
+        bool ignore_rate_echo = (now_m < suppress_rate_until_ms_ || now_m < mute_rates_until_ms_);
 
         while (true) {
             ssize_t len = ::read(ino_fd_.get(), buf, sizeof(buf));
@@ -1381,8 +1542,8 @@ private:
                             if (ev->wd == c.wd_up) { c.wd_up = -1; c.wd_up_ino = 0; }
                             if (ev->wd == c.wd_dn) { c.wd_dn = -1; c.wd_dn_ino = 0; }
                             need_rearm = true;
-                        } else if (cfg_.mode == "lock") {
-                            touched_rates.push_back(static_cast<int>(i));
+                        } else if (!ignore_rate_echo) {
+                            rate_touched = true;
                         }
                     } else if (ev->wd == c.wd_gov) {
                         if (ev->mask & IN_IGNORED) c.wd_gov = -1;
@@ -1403,11 +1564,12 @@ private:
             reload_config_and_apply("config_change");
             return;
         }
-        int64_t now_m = mono_ms();
         if (scene_dirty && cfg_.mode == "scene" && cfg_.enabled && !is_recent_scene_self_write(now_m)) {
+            cached_schemes_ = parse_all_scene_schemes(paths_, clusters_);
             if (sync_from_scene(true)) {
-                enforce_clusters(cfg_, clusters_, state_, log_, "scene_change", false);
-                schedule_burst({500}, "scene_verify");
+                active_cfg_ = cfg_;
+                run_enforce(active_target_cfg(), "scene_change", false);
+                schedule_burst({400}, "scene_verify");
             }
         }
 
@@ -1426,7 +1588,7 @@ private:
             }
         }
         if (gov_event && cfg_.enabled) {
-            schedule_burst({120, 450}, "governor_restore");
+            schedule_burst({150, 450}, "governor_restore");
         }
 
         if (bl_dirty && cfg_.watch_screen) {
@@ -1435,15 +1597,15 @@ private:
                 if (prev_bl_ > 0 && cur_bl == 0) {
                     prev_bl_ = 0;
                     last_screen_off_ms_ = now_m;
+                    if (cfg_.enabled) schedule_burst({700}, "screen_off");
                 } else if (prev_bl_ == 0 && cur_bl > 0) {
                     int64_t off_dur = (last_screen_off_ms_ > 0) ? (now_m - last_screen_off_ms_) : 999999;
                     prev_bl_ = cur_bl;
-                    // Mute brightness watch briefly to absorb smooth ambient brightness ramp (70+ events/s)
                     rm_watch(wd_bl_);
                     bl_rearm_block_until_ms_ = now_m + 1800;
                     schedule_burst({1850}, "bl_rearm");
-                    if (cfg_.enabled && (cfg_.mode != "passive" || off_dur >= 2000)) {
-                        schedule_burst({1300}, "screen_on");
+                    if (cfg_.enabled && off_dur >= 1500) {
+                        schedule_burst({1200}, "screen_on");
                     }
                 } else if (prev_bl_ > 0 && cur_bl > 0) {
                     prev_bl_ = cur_bl;
@@ -1456,26 +1618,39 @@ private:
             }
         }
 
-        if (!touched_rates.empty() && cfg_.enabled && cfg_.mode == "lock") {
-            std::sort(touched_rates.begin(), touched_rates.end());
-            touched_rates.erase(std::unique(touched_rates.begin(), touched_rates.end()),
-                                touched_rates.end());
-            for (int idx : touched_rates) {
-                Cluster& c = clusters_[idx];
-                if (now_m < c.suppress_until_ms) continue;
-                if (now_m - c.burst_start_ms > 2000) {
-                    c.burst_start_ms = now_m;
-                    c.burst_count = 1;
+        if (rate_touched && cfg_.enabled) {
+            // Group a multi-cluster 6-node write batch (~150ms) into a single burst count
+            if (now_m - last_rate_burst_hit_ms_ >= 350) {
+                last_rate_burst_hit_ms_ = now_m;
+                if (now_m - rate_burst_window_ms_ > 2500) {
+                    rate_burst_window_ms_ = now_m;
+                    rate_burst_count_ = 1;
                 } else {
-                    ++c.burst_count;
-                    if (c.burst_count > 4) {
-                        c.suppress_until_ms = now_m + 10000;
-                        c.burst_count = 0;
-                        log_.write("lock cooldown 10s on " + c.policy_name + " (contention)");
-                    }
+                    ++rate_burst_count_;
                 }
             }
-            enforce_clusters(cfg_, clusters_, state_, log_, "overwrite", false);
+
+            if (cfg_.mode == "lock") {
+                if (rate_burst_count_ > 4) {
+                    mute_rates_until_ms_ = now_m + 5000;
+                    rate_burst_count_ = 0;
+                    disarm_rate_watches();
+                    schedule_burst({5050}, "rate_rearm");
+                    log_.write("lock high-frequency cooldown 5s");
+                } else {
+                    schedule_rate_check(80);
+                }
+            } else {
+                // smart / scene mode: absorb sustained boost storms by temporarily disarming rate watches
+                if (rate_burst_count_ > 3) {
+                    mute_rates_until_ms_ = now_m + 2200;
+                    rate_burst_count_ = 0;
+                    disarm_rate_watches();
+                    schedule_burst({2250}, "rate_rearm");
+                } else {
+                    schedule_rate_check(220);
+                }
+            }
         }
     }
 
@@ -1530,16 +1705,12 @@ private:
             if (cfg_.watch_charger && unplugged) {
                 if (now_m - last_unplug_event_ms_ >= 2000) {
                     last_unplug_event_ms_ = now_m;
-                    if (cfg_.mode == "passive") {
-                        schedule_burst({650, 2400}, "charger_unplug");
-                    } else {
-                        schedule_burst({200, 900, 2600}, "charger_unplug");
-                    }
+                    schedule_burst({550, 2200}, "charger_unplug");
                 }
-            } else if (cfg_.watch_charger && plugged && cfg_.mode != "passive") {
+            } else if (cfg_.watch_charger && plugged) {
                 if (now_m - last_plug_event_ms_ >= 2000) {
                     last_plug_event_ms_ = now_m;
-                    schedule_burst({500}, "charger_plug");
+                    schedule_burst({650, 2200}, "charger_plug");
                 }
             }
 
@@ -1564,11 +1735,13 @@ private:
         int64_t now = mono_ms();
 
         bool do_bl_rearm = false;
+        bool do_rate_rearm = false;
         std::string enforce_reason;
         std::vector<PendingCheck> remaining;
         for (auto& t : timers_) {
             if (t.at_ms <= now + 5) {
                 if (t.reason == "bl_rearm") do_bl_rearm = true;
+                else if (t.reason == "rate_rearm") do_rate_rearm = true;
                 else if (enforce_reason.empty()) enforce_reason = t.reason;
             } else {
                 remaining.push_back(std::move(t));
@@ -1588,9 +1761,18 @@ private:
             }
             arm_watches();
         }
+        if (do_rate_rearm) {
+            mute_rates_until_ms_ = 0;
+            rate_burst_count_ = 0;
+            arm_watches();
+            if (enforce_reason.empty()) enforce_reason = "rate_rearm";
+        }
         if (cfg_.enabled && !enforce_reason.empty()) {
-            if (!do_bl_rearm) arm_watches();
-            enforce_clusters(cfg_, clusters_, state_, log_, enforce_reason, false);
+            if (!do_bl_rearm && !do_rate_rearm) arm_watches();
+            if (cfg_.mode == "scene" && (enforce_reason == "rate_check" || enforce_reason == "rate_rearm")) {
+                if (maybe_latch_scene_scheme()) return;
+            }
+            run_enforce(active_target_cfg(), enforce_reason, false);
         }
     }
 
@@ -1613,11 +1795,19 @@ private:
     }
 
 private:
+    Config active_cfg_;
+    SceneAllSchemes cached_schemes_;
     int64_t bl_rearm_block_until_ms_ = 0;
     int64_t last_unplug_event_ms_ = 0;
     int64_t last_plug_event_ms_ = 0;
     int64_t last_screen_off_ms_ = 0;
     int64_t suppress_scene_watch_until_ms_ = 0;
+    int64_t mute_rates_until_ms_ = 0;
+    int64_t suppress_rate_until_ms_ = 0;
+    int64_t rate_check_first_ms_ = 0;
+    int64_t rate_burst_window_ms_ = 0;
+    int64_t last_rate_burst_hit_ms_ = 0;
+    int rate_burst_count_ = 0;
     int low_bat_last_reported_ = -1;
 };
 
@@ -1866,6 +2056,15 @@ int main(int argc, char** argv) {
 
     std::string cmd = argv[1];
     if (cmd == "daemon") {
+        if (argc >= 3 && std::string(argv[2]) == "--bg") {
+            pid_t p1 = ::fork();
+            if (p1 < 0) return 1;
+            if (p1 > 0) return 0;
+            ::setsid();
+            pid_t p2 = ::fork();
+            if (p2 < 0) ::_exit(1);
+            if (p2 > 0) ::_exit(0);
+        }
         Daemon d(paths);
         return d.run();
     } else if (cmd == "status") {
