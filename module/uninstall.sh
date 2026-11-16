@@ -1,15 +1,15 @@
 #!/system/bin/sh
-# Stop the daemon before the module directory disappears.
-DATA=/data/adb/scene_rate_guard
-if [ -r "$DATA/daemon.pid" ]; then
-    pid=$(cat "$DATA/daemon.pid" 2>/dev/null)
-    case "$pid" in
-        ''|*[!0-9]*) ;;
-        *)
-            if grep -q 'scene_guard.sh' "/proc/$pid/cmdline" 2>/dev/null; then
-                kill "$pid" 2>/dev/null
-            fi
-            ;;
-    esac
+MODDIR=${0%/*}
+DATA=/data/adb/chaoxi
+BIN="$MODDIR/bin/chaoxid"
+
+if [ -x "$BIN" ]; then
+    "$BIN" stop >/dev/null 2>&1
+elif [ -r "$DATA/daemon.pid" ]; then
+    old=$(cat "$DATA/daemon.pid" 2>/dev/null)
+    [ -n "$old" ] && kill "$old" 2>/dev/null
 fi
-rm -rf "$DATA"
+
+sleep 0.2
+rm -rf "$DATA" 2>/dev/null
+exit 0
