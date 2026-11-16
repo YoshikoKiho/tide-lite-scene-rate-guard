@@ -1,242 +1,100 @@
-# 潮汐 Lite · Scene Rate Guard
+# 潮汐 · Tide（CPU Rate Limit 事件守护模块）
 
-> 只守护 MediaTek `sugov_ext` 的 `up_rate_limit_us` / `down_rate_limit_us`。  
-> 不修改 governor，不修改 `scaling_min_freq` / `scaling_max_freq`。
+一款基于 **Linux 内核事件机制（`epoll` + `inotify` + `Netlink` + `timerfd`）** 与 **静态 C++17** 实现的 KernelSU 模块，专注解决多集群 CPU `up_rate_limit_us` / `down_rate_limit_us` 参数在**拔掉充电器、低电量、长时间息屏再亮屏及调频器切换**后被系统或电源管理服务覆盖回默认值的问题。
 
-一个面向 **Redmi K80 Ultra（dali / 25060RK16C）** 的 KernelSU 模块。它解决的是 Scene 参数在充电器拔出、亮屏、重启后被系统或电源 HAL 覆盖的问题；同时修正旧版模块把频率上限抬回满频导致的高功耗。
+模块内置 **莫奈动态取色 WebUI**，支持自定义壁纸与字体，并支持将配置**直接设为系统与模块默认参数，同时统一覆写 Scene 调度策略档位**，在不干预常规调频与日常触控提频的前提下恢复正常待机与亮屏功耗。
 
-![首页](docs/screenshots/home.jpg)
+---
 
-## 为什么需要它
+## 核心调控逻辑（v1.1.0 改进架构）
 
-这台机器的 CPU 调频节点实际是：
+针对传统“高频轮询脚本 / 全时段抢占节点”造成额外唤醒与功耗升高的问题，**潮汐** 采用**低感知、场景触发、写读分离**的事件驱动设计：
 
-```text
-/sys/devices/system/cpu/cpufreq/policy0/sugov_ext/up_rate_limit_us
-/sys/devices/system/cpu/cpufreq/policy0/sugov_ext/down_rate_limit_us
-/sys/devices/system/cpu/cpufreq/policy4/sugov_ext/up_rate_limit_us
-/sys/devices/system/cpu/cpufreq/policy4/sugov_ext/down_rate_limit_us
-/sys/devices/system/cpu/cpufreq/policy7/sugov_ext/up_rate_limit_us
-/sys/devices/system/cpu/cpufreq/policy7/sugov_ext/down_rate_limit_us
-```
+1. **全事件零轮询架构（`chaoxid`）**
+   - 主循环完全阻塞在内核 `epoll_wait(..., -1)` 上等待中断事件，日常空闲期不产生定时器轮询，静态编译体积轻巧、常驻内存百 KB 级。
+   - 仅定位并写入各集群调频器目录（如 `sugov_ext` / `schedutil`）下的 `up_rate_limit_us` 与 `down_rate_limit_us`，**绝不修改 `scaling_governor` 或 `scaling_min_freq` / `scaling_max_freq`**。
 
-不是 `rate_limit_us`。旧版 `rate_limit_guard` 写入了不存在的节点，同时还尝试写 governor 和三簇频率上下限；频率写入被内核拒绝后，整个应用返回 `write_failed`，并且把 Scene 原本较低的最高频率恢复成满频，功耗自然更高。
+2. **三档覆盖防护模式（默认：`passive` 宽松被动）**
+   - **`passive`（宽松被动 · 省电推荐）**
+     - **零持续节点监听**：完全撤除 `up_rate_limit_us` / `down_rate_limit_us` 的 `inotify` 盯防，绝不与系统正常的短时触控升频（例如短暂切换 `0/6000`）对抗，彻底消除日常滑动时的无效上下文切换与锁频竞争。
+     - **高风险场景被动恢复**：仅响应内核发来的关键硬件/状态变化：
+       - **拔充恢复**：通过 Netlink `KOBJECT_UEVENT` 原始缓冲预过滤 `SUBSYSTEM=power_supply`，对多电源节点突发事件做 `2000ms` 去重合并，仅在拔充后执行轻量化核对。
+       - **低电量保护**：跨越低电量阈值或每下降 5% 时触发一次被动校验。
+       - **长息屏再亮屏校准**：监听背光节点 `0 -> >0` 唤醒，息屏时长 `>= 2s` 时延迟 `1300ms` 执行单次校准（避开亮屏解锁瞬间的系统提频，检测到活跃提频时自动避让）。
+       - **调频器目录重建**：监听策略目录 `IN_CREATE` 与 `scaling_governor` 真实切换（例如从性能模式切回时重建 rate 节点），自动重新挂载监听并恢复参数。
+     - **亮度渐变防抖与低闪存写入**：当屏幕处于点亮状态下触发自动亮度平滑渐变时，立即临时摘除背光监听 `1800–2000ms` 后静默重挂，消除密集亮度调节唤醒；状态计数文件节流至 `300s`（5 分钟）或退出时落盘，常规状态下仅在发生实际修复时写日志。
+   - **`scene`（Scene 策略联动）**
+     - 保持日常零主动争夺逻辑，额外监听 Scene `profile.json` 切换（自动排除自身写入后 `3000ms` 自触发窗口）。
+   - **`lock`（强力实时锁定）**
+     - 实时监控节点改写并在被覆写时写回；内置 `2000ms` 内高频争抢超 4 次自动进入 **`10s` 冷却退避** 的保护熔断。
 
-潮汐 Lite 只做一件事：**把三簇的升/降频限幅按住**。
+3. **系统 · 模块默认 · Scene 策略统一写入**
+   - 前端点击写入或通过 `chaoxid apply ... --scheme <none|powersave|balance|performance|all>` 执行时：
+     1. 立即原子写入内核 `sysfs` 并刷新守护内存目标；
+     2. 同步持久化为 `/data/adb/chaoxi/config.conf` 模块与系统默认配置（移除旧版自动回读覆写逻辑，确保手动修改不再被旧配置顶回）；
+     3. 如指定 Scene 档位，同步保留原属主与权限原子修改 Scene `profile.json` 对应策略块及 `objects/<scheme>` 序列化对象，使**系统当前值、模块默认值与 Scene 策略值三方保持一致**。
 
-## 工作原理
+---
 
-```text
-┌──────────────────────────────┐
-│ 每 2 秒读取三簇 up/down 节点 │
-└──────────────┬───────────────┘
-               │ 值不一致 / 事件触发
-               ▼
-┌──────────────────────────────┐
-│ 同时写入同一簇的 up 与 down  │
-│ 写后回读校验                  │
-└──────────────┬───────────────┘
-               │
-               ▼
-        日志 + 回写计数
-```
-
-### 事件触发
-
-| 时机 | 行为 |
-|---|---|
-| 开机满 60 秒 | 启动守护并做第一次校准 |
-| 充电器接入/拔出 | 检测 `online/status` 变化，立即执行 3 连写（0s / 0.3s / 0.9s） |
-| 息屏 → 亮屏 | 由 2 秒校验兜底，覆盖亮屏后系统重写 |
-| 电量 ≤ 5% | 每 30 秒检查一次，跨过门槛时强制写一次；高于 7% 复位 |
-| 日常 | 每 2 秒比对，只在值不一致时写入，稳定时零写入 |
-
-### 只碰 rate limit
-
-模块不修改：
-
-- `scaling_governor`
-- `scaling_min_freq`
-- `scaling_max_freq`
-- CPU online / cpuset / GPU
-
-因此不会再把 Scene 的频率上限覆盖掉，也不会和 Scene 的 governor 抢控制权。
-
-## Scene 预设
-
-WebUI 会读取 Scene 的：
-
-```text
-/data/data/com.omarea.vtools/files/profile.json
-```
-
-解析其中的 rate limit 字段，生成三个预设：
-
-| Scene 方案 | cluster 0 | cluster 1 | cluster 2 |
-|---|---:|---:|---:|
-| 省电 `powersave` | 16000 | 12000 | 4000 |
-| 均衡 `balance` | 8000 | 4000 | 1000 |
-| 性能 `performance` | 2000 | 1000 | 400 |
-
-单位均为 µs。点预设填入，再点「应用并守护」。Scene 的 `fast` 方案使用 `performance` governor，没有 rate 字段，因此不会出现在预设里。
-
-> 模块会持续守住最后一次应用的值。若在 Scene 里切换了模式，请回到 WebUI 点对应的 Scene 预设再应用。
-
-## 适配范围
-
-### 已验证
-
-| 项目 | 值 |
-|---|---|
-| 机型 | Redmi K80 Ultra |
-| 型号 / 代号 | 25060RK16C / `dali` |
-| SoC | MediaTek Dimensity 9400+ / `MT6991` |
-| 系统 | HyperOS 3 / Android 16（真机为定制版） |
-| Root | KernelSU `3.2.5` |
-| WebUI | KsuWebUI |
-
-真机验证内容：
-
-- 三簇 `up/down_rate_limit_us` 可写、可回读；
-- 守护运行中将三簇改成 `10/10`，下一轮被恢复为 `8000/4000/1000`；
-- 开机满 60 秒启动守护；
-- 充电器状态变化触发重新写入；
-- WebUI 读取 Scene 预设、应用参数、暂停/恢复。
-
-### 条件兼容
-
-- MediaTek 平台，内核实际暴露 `sugov_ext/up_rate_limit_us` 与 `sugov_ext/down_rate_limit_us`；
-- 当前 governor 为 `sugov_ext`；
-- KernelSU / KernelSU Next / SukiSU；标准 Magisk 可以运行脚本，但没有 KernelSU WebUI；
-- Android 14–16 中具备上述节点和 KernelSU WebUI 的环境。
-
-### 不适用
-
-- 内核没有 `up_rate_limit_us` / `down_rate_limit_us`；
-- 非 MediaTek 平台，或调频器不是 `sugov_ext`；
-- 需要模块修改 governor、频率范围、GPU、cpuset 的场景；
-- 无 Root 环境。
-
-> 不同机型、内核版本即使同为天玑 9400+，节点数量和 SELinux 权限也可能不同；安装前请先运行下方“节点检查”。
-
-## 安装
-
-1. 在 KernelSU 管理器中禁用或卸载旧模块 `rate_limit_guard`，避免它继续写 governor/频率。
-2. 安装 [`release/scene_rate_guard-v1.0.0.zip`](release/scene_rate_guard-v1.0.0.zip)。
-3. 重启手机。
-4. 打开模块 WebUI。
-5. 选择 Scene 省电 / 均衡 / 性能，或手动填写三簇数值。
-6. 点「应用并守护」。
-
-### 首次使用建议
-
-- 如果当前 Scene 是均衡，选 **Scene 均衡**，值为 `8000 / 4000 / 1000`；
-- 如果当前 Scene 是省电，选 **Scene 省电**，值为 `16000 / 12000 / 4000`；
-- 使用自定义值时，范围是 `0–20000 µs`。
-
-## 界面
-
-<table>
-  <tr>
-    <td><img src="docs/screenshots/home.jpg" alt="首页" width="320"></td>
-    <td><img src="docs/screenshots/liquid-glass.jpg" alt="液态玻璃" width="320"></td>
-    <td><img src="docs/screenshots/scene-presets.jpg" alt="Scene 预设" width="320"></td>
-  </tr>
-</table>
-
-- 只保留 rate limit 相关控件；
-- 去掉震动与触感设置；
-- 去掉 governor 和频率调节；
-- 滑条用 `requestAnimationFrame` 合帧更新；
-- 5 套莫奈配色 + **液态玻璃**风格；
-- 内置壁纸、自定义壁纸上传、字体选择。
-
-## 目录
+## 仓库目录结构
 
 ```text
 .
-├── module/                  # 模块源码
-│   ├── bin/scene_guard.sh   # 守护与写入逻辑
-│   ├── webroot/             # WebUI
-│   ├── customize.sh
-│   ├── service.sh
-│   ├── uninstall.sh
-│   └── module.prop
-├── release/                 # 可安装 ZIP 与 SHA-256
-├── docs/screenshots/        # 真机截图
-└── scripts/package.sh       # 重新打包脚本
+├── src/
+│   └── chaoxid.cpp          # C++17 核心事件守护进程与 CLI / Scene 写穿引擎
+├── module/
+│   ├── module.prop          # KernelSU 模块元数据 (id=chaoxi)
+│   ├── customize.sh         # 安装权限与二进制部署脚本
+│   ├── service.sh           # 开机自启守护脚本
+│   ├── uninstall.sh         # 卸载清理脚本
+│   ├── bin/
+│   │   └── chaoxid          # 静态编译 arm64-musl 守护二进制
+│   └── webroot/
+│       └── index.html       # 莫奈动态取色 / 自定义壁纸字体交互前端
+└── build.ps1                # Zig aarch64-linux-musl 编译与 ZIP 打包脚本
 ```
 
-## 排错
+---
 
-### 没有找到节点
+## 功能与界面
+
+- **独立三簇调控**：自动识别设备 `policy*` CPU 簇（按频段排序），支持 `up_rate_limit_us` 与 `down_rate_limit_us` 联动或独立微调，提供预设胶囊与 Scene 档位一键读取/覆写。
+- **莫奈取色与个性化外观**：支持跟随系统 / 浅色 / 深色模式、内置壁纸及自定义壁纸色板提取、背景高斯虚化与卡片透明度调节、圆体 / 楷体 / 等宽字体及本地字体导入。
+- **前端仅在开启 WebUI 时运行**：关闭页面不驻留任何 WebView 或前端脚本进程，日常后台仅运行轻量原生 `chaoxid` 守护进程。
+
+---
+
+## 安装与构建
+
+### 直接安装（推荐）
+1. 在 [Releases](../../releases) 下载最新 `chaoxi-v1.1.0.zip`（如升级前曾安装旧测试版或同名兼容模块，建议先禁用或清理旧版避免冲突）。
+2. 打开 KernelSU 管理器 → 模块 → 从本地安装 → 刷入 ZIP 并重启，或刷入后在模块列表点击「WebUI / 操作」进入配置界面。
+3. 在「触发策略与日志」页确认模式为 **宽松被动（省电推荐）**；在「速率调校」页选择参数并按需勾选同步覆盖 Scene 档位，点击底部「应用并设为默认」即可。
+
+### 从源码编译（Windows / Zig 工具链）
+需安装 [Zig](https://ziglang.org/) 工具链并调整 [build.ps1](build.ps1) 中的路径变量后运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build.ps1
+```
+
+将在仓库根目录生成静态链接 `aarch64-linux-musl` 二进制并打包为可刷入 ZIP。
+
+---
+
+## 常用排错命令（Root Shell）
 
 ```sh
-su -c 'find /sys/devices/system/cpu/cpufreq -name "*rate_limit_us"'
-su -c 'for p in /sys/devices/system/cpu/cpufreq/policy*; do
-  echo "=== $p"
-  cat "$p/scaling_governor"
-  ls -l "$p/sugov_ext" 2>/dev/null
-done'
+# 查看运行状态、当前防护模式及各簇 sysfs 与目标值对比
+/data/adb/modules/chaoxi/bin/chaoxid status
+
+# 查看事件恢复日志
+/data/adb/modules/chaoxi/bin/chaoxid log 60
+
+# 手动应用参数并同步写入 Scene 指定档位 (none|powersave|balance|performance|all)
+/data/adb/modules/chaoxi/bin/chaoxid apply 8000 8000 4000 4000 1000 1000 --scheme powersave
 ```
 
-### 写入失败
+## 许可
 
-```sh
-su -c 'tail -n 80 /data/adb/scene_rate_guard/guard.log'
-su -c 'dmesg | grep avc | tail -40'
-```
-
-### Scene 预设不显示
-
-```sh
-su -c 'ls -l /data/data/com.omarea.vtools/files/profile.json'
-```
-
-如果文件不存在，仍可在 WebUI 手动填写三簇值。
-
-### 查看当前运行状态
-
-```sh
-su -c 'cat /data/adb/scene_rate_guard/config.conf'
-su -c 'cat /data/adb/scene_rate_guard/values.conf'
-su -c 'tail -n 30 /data/adb/scene_rate_guard/guard.log'
-```
-
-## 构建
-
-```sh
-cd module
-zip -r ../release/scene_rate_guard-v1.0.0.zip \
-  module.prop customize.sh service.sh uninstall.sh README.md bin webroot
-sha256sum ../release/scene_rate_guard-v1.0.0.zip
-```
-
-或者运行：
-
-```sh
-bash scripts/package.sh
-```
-
-## 版本
-
-### v1.0.0
-
-- 首次发布；
-- 只管理 `up/down_rate_limit_us`；
-- 修复旧版 `rate_limit_us` 路径错误与频率写入失败；
-- Scene 省电/均衡/性能预设；
-- 液态玻璃主题；
-- 移除震动、触感设置、governor 与频率调节。
-
-## English
-
-**Tide Lite · Scene Rate Guard** is a KernelSU module for the Redmi K80 Ultra (`dali`, Dimensity 9400+ / MT6991). It only rewrites the per-cluster `sugov_ext` `up_rate_limit_us` and `down_rate_limit_us` values. It never changes the governor or frequency limits.
-
-It verifies the six rate nodes every two seconds, re-applies after charger changes, and starts guarding 60 seconds after boot. Scene `profile.json` presets for powersave, balance, and performance are available in the WebUI. Tested on HyperOS 3 / Android 16 with KernelSU 3.2.5.
-
-## 致谢
-
-- [Scene](https://vtools.omarea.com/)：提供 profile 结构和调频思路；
-- [KernelSU](https://kernelsu.org/)：模块与 WebUI 运行环境；
-- 真机测试：Redmi K80 Ultra / HyperOS 3。
+模块源代码遵循 MIT License 开源，可自由修改与二次编译用于个人设备。

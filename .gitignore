@@ -1,7 +1,4 @@
+chaoxi-*.zip
+*.tmp
 .DS_Store
 Thumbs.db
-*.log
-*.tmp
-__pycache__/
-node_modules/
-.ghprobe/
