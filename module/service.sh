@@ -20,9 +20,6 @@ if [ -r "$DATA/daemon.pid" ]; then
     esac
 fi
 
-if command -v nohup >/dev/null 2>&1; then
-    nohup "$BIN" daemon </dev/null >/dev/null 2>&1 &
-else
-    "$BIN" daemon </dev/null >/dev/null 2>&1 &
-fi
+# 由二进制内部执行 --bg 双重 fork、cgroup 逃逸与 oom_score_adj=-900 保护（避免随前端被回收）
+"$BIN" daemon --bg
 exit 0
