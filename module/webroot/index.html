@@ -1182,7 +1182,7 @@
         </div>
         <div class="stat-chip">
           <span class="stat-k">守护模式</span>
-          <span class="stat-v" id="st-mode">宽松被动</span>
+          <span class="stat-v" id="st-mode">智能守卫</span>
         </div>
       </div>
       <div class="hero-foot">
@@ -1230,17 +1230,17 @@
       <section class="card">
         <h3 class="sec-title">覆盖防护模式</h3>
         <div class="mode-grid">
-          <button class="mode-opt active" data-mode="passive" type="button">
-            <div class="mode-opt-title"><span>宽松被动</span><span class="mode-badge">省电推荐</span></div>
-            <div class="mode-opt-desc">平时不盯防调频节点、不与系统升频争夺（零多余唤醒）；仅在拔充、低电量、息屏后再亮屏与调度重建时静默恢复默认参数。</div>
+          <button class="mode-opt active" data-mode="smart" type="button">
+            <div class="mode-opt-title"><span>智能低耗守卫</span><span class="mode-badge">默认推荐</span></div>
+            <div class="mode-opt-desc">平时零轮询阻塞深睡；放行系统短时提频（0us）不争抢烧电，一旦系统在任意场景写回 10us 等默认重置值立刻毫秒级改回并休眠。</div>
           </button>
           <button class="mode-opt" data-mode="scene" type="button">
-            <div class="mode-opt-title"><span>Scene 策略联动</span><span class="mode-badge">低耗被动</span></div>
-            <div class="mode-opt-desc">同样保持日常零主动争夺，同时自动跟随你在 Scene 内切换的省电/均衡/性能速率配置。</div>
+            <div class="mode-opt-title"><span>Scene 档位自适应</span><span class="mode-badge">联动守卫</span></div>
+            <div class="mode-opt-desc">同样具备 10us 重置瞬时恢复与提频避让，且在 Scene 切换省电/均衡/性能不同数值时自动跟随对应档位。</div>
           </button>
           <button class="mode-opt" data-mode="lock" type="button">
-            <div class="mode-opt-title"><span>强力实时锁定</span><span class="mode-badge">较高功耗</span></div>
-            <div class="mode-opt-desc">实时监控内核速率节点改写并立即写回（带 10 秒高频退避保护），适合严防任意后台短暂改写。</div>
+            <div class="mode-opt-title"><span>强力实时锁定</span><span class="mode-badge">退避锁定</span></div>
+            <div class="mode-opt-desc">连系统短时提频也一律写回（内置自写入屏蔽与 5 秒高频争抢退避保护），适合严防任何后台短暂改写。</div>
           </button>
         </div>
       </section>
@@ -1836,10 +1836,14 @@
     // ========= 业务逻辑：集群与状态渲染 =========
     function reasonText(r) {
       const map = {
+        rate_check: '拦截系统重置',
+        rate_rearm: '退避恢复校准',
         overwrite: '拦截系统覆盖',
         charger_unplug: '拔掉充电器保护',
+        charger_plug: '插入充电器校准',
         low_battery: '低电量保护',
         screen_on: '亮屏唤醒恢复',
+        screen_off: '息屏降耗校准',
         governor_restore: '调度重建恢复',
         webui_apply: '前端设为默认',
         sync_scene: '已同步 Scene',
@@ -2021,8 +2025,8 @@
 
       $('st-power').textContent = `${st.battery >= 0 ? st.battery + '%' : '--'} ${st.charging ? '充电中' : '放电'}`;
       $('st-fixes').textContent = `${st.fixes || 0} 次`;
-      const modeLabelMap = { passive: '宽松被动', scene: 'Scene 联动', lock: '实时锁定' };
-      $('st-mode').textContent = modeLabelMap[st.mode] || '宽松被动';
+      const modeLabelMap = { smart: '智能守卫', passive: '智能守卫', scene: 'Scene 联动', lock: '强力锁定' };
+      $('st-mode').textContent = modeLabelMap[st.mode] || '智能守卫';
 
       $('low-bat-val').textContent = `${st.low_bat_threshold || 20}%`;
       $('low-bat-range').value = String(st.low_bat_threshold || 20);
