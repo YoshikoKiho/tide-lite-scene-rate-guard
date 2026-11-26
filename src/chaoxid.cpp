@@ -40,7 +40,6 @@ struct Paths {
     std::string pid_file;
     std::string lock_file;
     std::string ui_file;
-    std::string scene_write_stamp;
 
     void init() {
         if (const char* e = std::getenv("CHAOXI_DATA")) data_dir = e;
@@ -54,7 +53,6 @@ struct Paths {
         pid_file   = data_dir + "/daemon.pid";
         lock_file  = data_dir + "/daemon.lock";
         ui_file    = data_dir + "/ui.json";
-        scene_write_stamp = data_dir + "/.scene_write_ms";
     }
 };
 
@@ -133,11 +131,45 @@ bool write_uint_sysfs(const std::string& path, uint64_t val) {
     int len = snprintf(buf, sizeof(buf), "%llu\n", static_cast<unsigned long long>(val));
     if (len <= 0) return false;
     UniqueFd fd(::open(path.c_str(), O_WRONLY | O_CLOEXEC));
-    if (!fd.valid()) return false;
+    bool restored_mode = false;
+    mode_t prev_mode = 0664;
+    if (!fd.valid() && (errno == EACCES || errno == EPERM)) {
+        struct stat st {};
+        if (::stat(path.c_str(), &st) == 0) {
+            prev_mode = st.st_mode & 0777;
+            if (::chmod(path.c_str(), 0664) == 0) {
+                restored_mode = true;
+                fd.reset(::open(path.c_str(), O_WRONLY | O_CLOEXEC));
+            }
+        }
+    }
+    if (!fd.valid()) {
+        if (restored_mode) ::chmod(path.c_str(), prev_mode);
+        return false;
+    }
     ssize_t n = ::write(fd.get(), buf, static_cast<size_t>(len));
+    fd.reset();
+    if (restored_mode) ::chmod(path.c_str(), prev_mode);
     if (n <= 0) return false;
     uint64_t verify = 0;
     return read_uint(path, verify) && verify == val;
+}
+
+bool is_path_shielded(const std::string& path) {
+    struct stat st {};
+    return ::stat(path.c_str(), &st) == 0 && (st.st_mode & 0222) == 0;
+}
+
+std::string format_path_mode(const std::string& path) {
+    struct stat st {};
+    if (::stat(path.c_str(), &st) != 0) return "";
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%04o", static_cast<unsigned>(st.st_mode & 0777));
+    return buf;
+}
+
+bool mode_uses_shield(const std::string& mode) {
+    return mode == "override" || mode == "shield";
 }
 
 bool write_atomic_file(const std::string& path, const std::string& content, mode_t mode = 0600) {
@@ -267,7 +299,7 @@ std::string get_prop(const char* name) {
 
 struct Config {
     bool enabled = true;
-    std::string mode = "smart"; // "smart" (default), "scene", "lock"
+    std::string mode = "override"; // "override" (default 0444 lock), "shield" (0444 Scene passthrough), "compat" (0664 boost-exempt)
     int low_bat_threshold = 20;
     bool watch_charger = true;
     bool watch_screen = true;
@@ -302,6 +334,8 @@ struct Cluster {
     int wd_dn = -1;
     ino_t wd_up_ino = 0;
     ino_t wd_dn_ino = 0;
+    uint32_t wd_up_mask = 0;
+    uint32_t wd_dn_mask = 0;
 
     int64_t burst_start_ms = 0;
     int burst_count = 0;
@@ -310,6 +344,10 @@ struct Cluster {
 
 struct Logger {
     std::string path;
+    int64_t fix_window_ms = 0;
+    int fix_window_lines = 0;
+    int suppressed_lines = 0;
+
     void write(const std::string& msg) {
         if (path.empty()) return;
         struct stat st {};
@@ -326,6 +364,24 @@ struct Logger {
         if (!fd.valid()) return;
         std::string line = now_str() + " " + msg + "\n";
         (void)::write(fd.get(), line.data(), line.size());
+    }
+
+    void write_fix_throttled(const std::string& msg) {
+        int64_t now_m = mono_ms();
+        if (fix_window_ms == 0 || now_m - fix_window_ms >= 60000) {
+            if (suppressed_lines > 0) {
+                write("summary: +" + std::to_string(suppressed_lines) + " fix logs folded in last 60s");
+                suppressed_lines = 0;
+            }
+            fix_window_ms = now_m;
+            fix_window_lines = 0;
+        }
+        if (fix_window_lines < 12) {
+            ++fix_window_lines;
+            write(msg);
+        } else {
+            ++suppressed_lines;
+        }
     }
 };
 
@@ -777,15 +833,14 @@ bool write_scene_schemes(const Paths& paths, const std::vector<Cluster>& cluster
         if (!synced_out.empty()) synced_out += ",";
         synced_out += name;
     }
-    // Mark timestamp so running chaoxid daemon ignores this self-write in scene mode
-    write_atomic_file(paths.scene_write_stamp, std::to_string(mono_ms()) + "\n", 0600);
     return true;
 }
 
 std::string normalize_mode(const std::string& v) {
-    if (v == "scene" || v == "lock" || v == "smart") return v;
-    // Upgrade legacy "passive" seamlessly to the fixed boost-exempt "smart" watcher
-    return "smart";
+    if (v == "override" || v == "shield" || v == "compat") return v;
+    if (v == "scene") return "shield";
+    if (v == "lock" || v == "smart" || v == "passive") return "override";
+    return "override";
 }
 
 void load_config(const Paths& paths, const std::vector<Cluster>& clusters, Config& cfg) {
@@ -990,15 +1045,40 @@ void detach_daemon_stdio() {
     }
 }
 
+bool set_cluster_shield(const Cluster& c, bool readonly) {
+    if (!is_governor_rate_active(c.governor) || c.up_path.empty() || c.dn_path.empty()) return false;
+    mode_t target = readonly ? 0444 : 0664;
+    bool changed = false;
+    for (const std::string* p : {&c.up_path, &c.dn_path}) {
+        struct stat st {};
+        if (::stat(p->c_str(), &st) == 0 && (st.st_mode & 0777) != target) {
+            if (::chmod(p->c_str(), target) == 0) changed = true;
+        }
+    }
+    return changed;
+}
+
+bool sync_all_shields(const Config& cfg, std::vector<Cluster>& clusters, bool force_unshield = false) {
+    bool want_shield = !force_unshield && cfg.enabled && mode_uses_shield(cfg.mode);
+    bool changed = false;
+    for (auto& c : clusters) {
+        refresh_cluster_rate_paths(c);
+        if (set_cluster_shield(c, want_shield)) changed = true;
+    }
+    return changed;
+}
+
 bool enforce_clusters(const Config& cfg, std::vector<Cluster>& clusters,
                       State& st, Logger& log, const std::string& reason,
-                      bool force, bool count_as_fix = true, bool* out_wrote_any = nullptr) {
+                      bool force, bool count_as_fix = true,
+                      bool only_fix_reset = false, bool* out_wrote_any = nullptr) {
     if (out_wrote_any) *out_wrote_any = false;
     if (!cfg.enabled) return true;
     bool all_ok = true;
     int64_t now_s = static_cast<int64_t>(time(nullptr));
     int64_t now_m = mono_ms();
-    bool skip_active_boost = (!force && cfg.mode != "lock" &&
+    bool want_shield = mode_uses_shield(cfg.mode);
+    bool skip_active_boost = (!force && cfg.mode == "compat" &&
                               reason != "screen_off" && reason != "charger_unplug" &&
                               reason != "low_battery" && reason != "boot");
 
@@ -1007,7 +1087,10 @@ bool enforce_clusters(const Config& cfg, std::vector<Cluster>& clusters,
         if (!is_governor_rate_active(c.governor)) continue;
         if (c.up_path.empty() || c.dn_path.empty()) continue;
 
-        if (!force && now_m < c.suppress_until_ms) continue;
+        if (!force && now_m < c.suppress_until_ms) {
+            if (want_shield) set_cluster_shield(c, true);
+            continue;
+        }
 
         uint64_t want_up = cfg.up[c.index];
         uint64_t want_dn = cfg.dn[c.index];
@@ -1015,14 +1098,27 @@ bool enforce_clusters(const Config& cfg, std::vector<Cluster>& clusters,
         bool got_up = read_uint(c.up_path, cur_up);
         bool got_dn = read_uint(c.dn_path, cur_dn);
 
-        // Exempt active vendor boosts (up=0, e.g. 0/0 or 0/6000) to avoid fighting PowerHAL
+        // In shield mode, preserve valid Scene per-app values and only repair HAL/kernel resets (<=100us)
+        if (only_fix_reset && !force) {
+            bool up_corrupted = !got_up || (cur_up <= 100 && want_up > 100);
+            bool dn_corrupted = !got_dn || (cur_dn <= 100 && want_dn > 100);
+            if (!up_corrupted && !dn_corrupted) {
+                if (want_shield) set_cluster_shield(c, true);
+                continue;
+            }
+        }
+
+        // In compat mode, exempt active vendor boosts (up=0) to avoid fighting PowerHAL
         if (skip_active_boost && got_up && cur_up == 0 && want_up > 0) {
             continue;
         }
 
         bool need_up = force || !got_up || cur_up != want_up;
         bool need_dn = force || !got_dn || cur_dn != want_dn;
-        if (!need_up && !need_dn) continue;
+        if (!need_up && !need_dn) {
+            if (want_shield) set_cluster_shield(c, true);
+            continue;
+        }
 
         bool changed = false;
         if (need_up) {
@@ -1041,6 +1137,8 @@ bool enforce_clusters(const Config& cfg, std::vector<Cluster>& clusters,
                 all_ok = false;
             }
         }
+        if (want_shield) set_cluster_shield(c, true);
+
         if (changed) {
             if (count_as_fix) {
                 ++st.fixes;
@@ -1053,7 +1151,7 @@ bool enforce_clusters(const Config& cfg, std::vector<Cluster>& clusters,
                         c.burst_count = 1;
                     } else {
                         ++c.burst_count;
-                        if (c.burst_count > 3) {
+                        if (c.burst_count > 4) {
                             c.suppress_until_ms = now_m + 10000;
                             c.burst_count = 0;
                             log.write("cooldown 10s on " + c.policy_name + " (contention)");
@@ -1061,11 +1159,13 @@ bool enforce_clusters(const Config& cfg, std::vector<Cluster>& clusters,
                     }
                 }
             }
-            log.write(std::string(count_as_fix ? "fix " : "apply ") +
-                      c.policy_name + " (" + reason + ") " +
-                      (got_up ? std::to_string(cur_up) : "?") + "/" +
-                      (got_dn ? std::to_string(cur_dn) : "?") + " -> " +
-                      std::to_string(want_up) + "/" + std::to_string(want_dn));
+            std::string entry = std::string(count_as_fix ? "fix " : "apply ") +
+                                c.policy_name + " (" + reason + ") " +
+                                (got_up ? std::to_string(cur_up) : "?") + "/" +
+                                (got_dn ? std::to_string(cur_dn) : "?") + " -> " +
+                                std::to_string(want_up) + "/" + std::to_string(want_dn);
+            if (count_as_fix && reason == "rate_check") log.write_fix_throttled(entry);
+            else log.write(entry);
         }
     }
     return all_ok;
@@ -1082,17 +1182,14 @@ public:
         lock_fd_.reset(::open(paths_.lock_file.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600));
         if (!lock_fd_.valid()) return 1;
         if (::flock(lock_fd_.get(), LOCK_EX | LOCK_NB) != 0) {
-            // Already running
             return 0;
         }
 
         detach_daemon_stdio();
         protect_daemon_process();
 
-        // Write PID cleanly
         write_atomic_file(paths_.pid_file, std::to_string(::getpid()) + "\n", 0644);
 
-        // Wait briefly for Android boot_completed if launched very early
         for (int i = 0; i < 60; ++i) {
             if (get_prop("sys.boot_completed") == "1") break;
             ::sleep(1);
@@ -1113,13 +1210,10 @@ public:
         clusters_ = discover_clusters(paths_);
         load_config(paths_, clusters_, cfg_);
         if (!file_exists(paths_.conf_file)) save_config(paths_, cfg_);
-        active_cfg_ = cfg_;
-        cached_schemes_ = parse_all_scene_schemes(paths_, clusters_);
         load_state(paths_, state_);
 
         init_local_tz_once();
 
-        // Initial power & backlight snapshots
         PowerInfo pi = read_power_info(paths_);
         last_charging_ = pi.charging;
         last_battery_ = pi.battery;
@@ -1131,16 +1225,16 @@ public:
             if (read_uint(backlight_path_, bl)) prev_bl_ = bl;
         }
 
+        sync_shields_quiet(false);
         arm_watches();
 
         log_.write("daemon started pid=" + std::to_string(::getpid()) +
                    " clusters=" + std::to_string(clusters_.size()) +
-                   " mode=" + cfg_.mode);
+                   " mode=" + cfg_.mode +
+                   " shield=" + (cfg_.enabled && mode_uses_shield(cfg_.mode) ? "0444" : "0664"));
 
-        // Boot enforcement + single settle check
         if (cfg_.enabled) {
-            if (cfg_.mode == "scene" && !file_exists(paths_.conf_file)) sync_from_scene(false);
-            run_enforce(active_target_cfg(), "boot", false, false);
+            run_enforce(cfg_, "boot", false, false, cfg_.mode == "shield");
             schedule_burst({3000}, "boot_verify");
         }
 
@@ -1161,8 +1255,10 @@ public:
             flush_state_throttled(false);
         }
 
+        // Cleanly restore 0664 permissions on daemon stop so system/user is never locked out
+        sync_all_shields(cfg_, clusters_, true);
         flush_state_throttled(true);
-        log_.write("daemon stopped");
+        log_.write("daemon stopped (0664 restored)");
         ::unlink(paths_.pid_file.c_str());
         return 0;
     }
@@ -1182,7 +1278,6 @@ private:
     UniqueFd sig_fd_;
 
     int wd_data_dir_ = -1;
-    int wd_scene_dir_ = -1;
     int wd_bl_ = -1;
     std::string backlight_path_;
     uint64_t prev_bl_ = 1;
@@ -1190,7 +1285,6 @@ private:
     bool last_charging_ = false;
     int last_battery_ = -1;
     std::map<std::string, uint64_t> psy_online_;
-    int64_t last_scene_apply_ms_ = 0;
 
     struct PendingCheck {
         int64_t at_ms;
@@ -1223,8 +1317,8 @@ private:
         ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf_sz, sizeof(buf_sz));
         struct sockaddr_nl addr {};
         addr.nl_family = AF_NETLINK;
-        addr.nl_pid = 0; // let kernel assign unique port id
-        addr.nl_groups = 1; // kernel uevents
+        addr.nl_pid = 0;
+        addr.nl_groups = 1;
         if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
             ::close(fd);
             return;
@@ -1261,10 +1355,23 @@ private:
             rm_watch(c.wd_dn);
             c.wd_up_ino = 0;
             c.wd_dn_ino = 0;
+            c.wd_up_mask = 0;
+            c.wd_dn_mask = 0;
         }
     }
 
     void arm_cluster_watches(Cluster& c, int64_t now_m) {
+        if (!cfg_.enabled) {
+            rm_watch(c.wd_dir);
+            rm_watch(c.wd_gov);
+            rm_watch(c.wd_up);
+            rm_watch(c.wd_dn);
+            c.wd_up_ino = 0;
+            c.wd_dn_ino = 0;
+            c.wd_up_mask = 0;
+            c.wd_dn_mask = 0;
+            return;
+        }
         if (c.wd_dir < 0) {
             c.wd_dir = ::inotify_add_watch(ino_fd_.get(), c.policy_dir.c_str(), IN_CREATE | IN_DELETE);
         }
@@ -1273,36 +1380,49 @@ private:
             c.wd_gov = ::inotify_add_watch(ino_fd_.get(), gpath.c_str(), IN_CLOSE_WRITE | IN_MODIFY);
         }
         refresh_cluster_rate_paths(c);
-        if (!cfg_.enabled || now_m < mute_rates_until_ms_) {
+        // shield mode: watch IN_ATTRIB only -> 0 wakeups from blocked PowerHAL, instant 0444 re-lock if Scene chmods 0664!
+        // override mode: watch writes + IN_ATTRIB -> catches CAP_DAC_OVERRIDE writes & chmods
+        // compat mode: watch writes only (0664 boost-exempt soft guard)
+        bool need_rate_watch = (cfg_.mode == "shield") || (now_m >= mute_rates_until_ms_);
+        if (!need_rate_watch) {
             rm_watch(c.wd_up);
             rm_watch(c.wd_dn);
             c.wd_up_ino = 0;
             c.wd_dn_ino = 0;
+            c.wd_up_mask = 0;
+            c.wd_dn_mask = 0;
             return;
         }
+        uint32_t rate_mask = (cfg_.mode == "shield")
+                                 ? (IN_ATTRIB | IN_DELETE_SELF)
+                                 : (cfg_.mode == "override"
+                                        ? (IN_CLOSE_WRITE | IN_MODIFY | IN_ATTRIB | IN_DELETE_SELF)
+                                        : (IN_CLOSE_WRITE | IN_MODIFY | IN_DELETE_SELF));
         struct stat su {};
         if (!c.up_path.empty() && ::stat(c.up_path.c_str(), &su) == 0) {
-            if (c.wd_up < 0 || su.st_ino != c.wd_up_ino) {
+            if (c.wd_up < 0 || su.st_ino != c.wd_up_ino || c.wd_up_mask != rate_mask) {
                 rm_watch(c.wd_up);
-                c.wd_up = ::inotify_add_watch(ino_fd_.get(), c.up_path.c_str(),
-                                              IN_CLOSE_WRITE | IN_MODIFY | IN_DELETE_SELF);
+                c.wd_up = ::inotify_add_watch(ino_fd_.get(), c.up_path.c_str(), rate_mask);
                 c.wd_up_ino = (c.wd_up >= 0) ? su.st_ino : 0;
+                c.wd_up_mask = (c.wd_up >= 0) ? rate_mask : 0;
             }
         } else {
             rm_watch(c.wd_up);
             c.wd_up_ino = 0;
+            c.wd_up_mask = 0;
         }
         struct stat sd {};
         if (!c.dn_path.empty() && ::stat(c.dn_path.c_str(), &sd) == 0) {
-            if (c.wd_dn < 0 || sd.st_ino != c.wd_dn_ino) {
+            if (c.wd_dn < 0 || sd.st_ino != c.wd_dn_ino || c.wd_dn_mask != rate_mask) {
                 rm_watch(c.wd_dn);
-                c.wd_dn = ::inotify_add_watch(ino_fd_.get(), c.dn_path.c_str(),
-                                              IN_CLOSE_WRITE | IN_MODIFY | IN_DELETE_SELF);
+                c.wd_dn = ::inotify_add_watch(ino_fd_.get(), c.dn_path.c_str(), rate_mask);
                 c.wd_dn_ino = (c.wd_dn >= 0) ? sd.st_ino : 0;
+                c.wd_dn_mask = (c.wd_dn >= 0) ? rate_mask : 0;
             }
         } else {
             rm_watch(c.wd_dn);
             c.wd_dn_ino = 0;
+            c.wd_dn_mask = 0;
         }
     }
 
@@ -1312,19 +1432,7 @@ private:
             wd_data_dir_ = ::inotify_add_watch(ino_fd_.get(), paths_.data_dir.c_str(),
                                                IN_CLOSE_WRITE | IN_MOVED_TO);
         }
-        if (cfg_.mode == "scene") {
-            size_t slash = paths_.scene_profile.rfind('/');
-            if (slash != std::string::npos) {
-                std::string sdir = paths_.scene_profile.substr(0, slash);
-                if (wd_scene_dir_ < 0 && dir_exists(sdir)) {
-                    wd_scene_dir_ = ::inotify_add_watch(ino_fd_.get(), sdir.c_str(),
-                                                        IN_CLOSE_WRITE | IN_MOVED_TO);
-                }
-            }
-        } else {
-            rm_watch(wd_scene_dir_);
-        }
-        if (cfg_.watch_screen && !backlight_path_.empty()) {
+        if (cfg_.enabled && cfg_.watch_screen && !backlight_path_.empty()) {
             if (wd_bl_ < 0 && now_m >= bl_rearm_block_until_ms_) {
                 wd_bl_ = ::inotify_add_watch(ino_fd_.get(), backlight_path_.c_str(),
                                              IN_CLOSE_WRITE | IN_MODIFY);
@@ -1352,7 +1460,6 @@ private:
 
     void schedule_burst(std::initializer_list<int> delays_ms, const std::string& reason) {
         int64_t now = mono_ms();
-        // Prune duplicate reason entries and cap queue size
         timers_.erase(std::remove_if(timers_.begin(), timers_.end(),
                                      [&](const PendingCheck& p) { return p.reason == reason; }),
                       timers_.end());
@@ -1367,97 +1474,18 @@ private:
         rearm_timerfd();
     }
 
-    bool sync_from_scene(bool log_change) {
-        SceneRates sr = parse_scene_profile(paths_, clusters_);
-        if (!sr.found) return false;
-        bool changed = false;
-        for (size_t i = 0; i < clusters_.size(); ++i) {
-            if (sr.has_up[i] && cfg_.up[i] != sr.up[i]) { cfg_.up[i] = sr.up[i]; changed = true; }
-            if (sr.has_dn[i] && cfg_.dn[i] != sr.dn[i]) { cfg_.dn[i] = sr.dn[i]; changed = true; }
-        }
-        if (changed) {
-            save_config(paths_, cfg_);
-            last_scene_apply_ms_ = mono_ms();
-            if (log_change) log_.write("synced values from Scene profile.json");
-        }
-        return changed;
+    void sync_shields_quiet(bool force_unshield = false) {
+        sync_all_shields(cfg_, clusters_, force_unshield);
     }
 
-    bool is_recent_scene_self_write(int64_t now_m) const {
-        if (now_m < suppress_scene_watch_until_ms_) return true;
-        std::string raw;
-        if (!read_file_str(paths_.scene_write_stamp, raw, 64)) return false;
-        raw = trim(raw);
-        if (raw.empty()) return false;
-        int64_t stamp = strtoll(raw.c_str(), nullptr, 10);
-        return stamp > 0 && now_m >= stamp && (now_m - stamp) <= 3000;
-    }
-
-    const Config& active_target_cfg() const {
-        return (cfg_.mode == "scene") ? active_cfg_ : cfg_;
-    }
-
-    void run_enforce(const Config& target, const std::string& reason, bool force, bool count_as_fix = true) {
+    void run_enforce(const Config& target, const std::string& reason,
+                     bool force, bool count_as_fix = true, bool only_fix_reset = false) {
         bool wrote = false;
-        enforce_clusters(target, clusters_, state_, log_, reason, force, count_as_fix, &wrote);
+        enforce_clusters(target, clusters_, state_, log_, reason, force, count_as_fix, only_fix_reset, &wrote);
         if (wrote) {
             // Suppress self-triggered inotify echoes from our own sysfs writes
-            suppress_rate_until_ms_ = mono_ms() + 80;
+            suppress_rate_until_ms_ = mono_ms() + 100;
         }
-    }
-
-    static bool scheme_differs(const SceneRates& a, const SceneRates& b, size_t nclusters) {
-        if (!a.found || !b.found) return false;
-        for (size_t i = 0; i < nclusters; ++i) {
-            if (a.has_up[i] && b.has_up[i] && a.up[i] != b.up[i]) return true;
-            if (a.has_dn[i] && b.has_dn[i] && a.dn[i] != b.dn[i]) return true;
-        }
-        return false;
-    }
-
-    bool maybe_latch_scene_scheme() {
-        if (cfg_.mode != "scene") return false;
-        const SceneRates* list[3] = {&cached_schemes_.powersave, &cached_schemes_.balance, &cached_schemes_.performance};
-        bool distinct = scheme_differs(*list[0], *list[1], clusters_.size()) ||
-                        scheme_differs(*list[1], *list[2], clusters_.size()) ||
-                        scheme_differs(*list[0], *list[2], clusters_.size());
-        if (!distinct) return false;
-
-        uint64_t cur_up[kMaxClusters] = {};
-        uint64_t cur_dn[kMaxClusters] = {};
-        bool got[kMaxClusters] = {};
-        for (size_t i = 0; i < clusters_.size(); ++i) {
-            refresh_cluster_rate_paths(clusters_[i]);
-            if (is_governor_rate_active(clusters_[i].governor) &&
-                !clusters_[i].up_path.empty() && !clusters_[i].dn_path.empty()) {
-                uint64_t u = 0, d = 0;
-                if (read_uint(clusters_[i].up_path, u) && read_uint(clusters_[i].dn_path, d)) {
-                    cur_up[i] = u;
-                    cur_dn[i] = d;
-                    got[i] = true;
-                }
-            }
-        }
-        for (const SceneRates* sr : list) {
-            if (!sr->found) continue;
-            bool match = true;
-            bool had_any = false;
-            for (size_t i = 0; i < clusters_.size(); ++i) {
-                if (!got[i]) continue;
-                if (!sr->has_up[i] || !sr->has_dn[i]) { match = false; break; }
-                if (cur_up[i] == 0 && sr->up[i] > 0) { match = false; break; }
-                if (cur_up[i] != sr->up[i] || cur_dn[i] != sr->dn[i]) { match = false; break; }
-                had_any = true;
-            }
-            if (match && had_any) {
-                for (size_t i = 0; i < clusters_.size(); ++i) {
-                    active_cfg_.up[i] = sr->up[i];
-                    active_cfg_.dn[i] = sr->dn[i];
-                }
-                return true;
-            }
-        }
-        return false;
     }
 
     void schedule_rate_check(int delay_ms) {
@@ -1481,33 +1509,48 @@ private:
     void reload_config_and_apply(const std::string& reason) {
         Config prev = cfg_;
         load_config(paths_, clusters_, cfg_);
-        active_cfg_ = cfg_;
-        cached_schemes_ = parse_all_scene_schemes(paths_, clusters_);
         for (auto& c : clusters_) {
             c.suppress_until_ms = 0;
             c.burst_count = 0;
         }
         mute_rates_until_ms_ = 0;
         rate_burst_count_ = 0;
+        attrib_burst_count_ = 0;
+        attrib_mute_until_ms_ = 0;
+        suppress_rate_until_ms_ = mono_ms() + 180;
+        timers_.erase(std::remove_if(timers_.begin(), timers_.end(),
+                                     [](const PendingCheck& p) {
+                                         return p.reason == "rate_check" || p.reason == "rate_rearm" ||
+                                                p.reason == "shield_relock";
+                                     }),
+                      timers_.end());
+        rearm_timerfd();
+
+        sync_shields_quiet(false);
         arm_watches();
+
         if (cfg_.enabled) {
-            run_enforce(active_target_cfg(), reason, false, false);
+            if (prev.mode != cfg_.mode || !prev.enabled) {
+                log_.write("mode=" + cfg_.mode +
+                           " shield=" + (mode_uses_shield(cfg_.mode) ? "0444" : "0664"));
+            }
+            run_enforce(cfg_, reason, false, false, cfg_.mode == "shield");
         } else if (prev.enabled && !cfg_.enabled) {
             timers_.clear();
             rearm_timerfd();
-            log_.write("paused by config");
+            log_.write("paused by config (0664 restored)");
         }
     }
 
     void handle_inotify() {
         alignas(struct inotify_event) char buf[8192];
         bool config_dirty = false;
-        bool scene_dirty = false;
         bool bl_dirty = false;
         bool need_rearm = false;
         bool gov_event = false;
         bool dir_recreated = false;
         bool rate_touched = false;
+        bool attrib_unshielded = false;
         std::vector<int> touched_govs;
 
         int64_t now_m = mono_ms();
@@ -1526,10 +1569,6 @@ private:
                     if (name == "config.conf") config_dirty = true;
                     continue;
                 }
-                if (ev->wd == wd_scene_dir_) {
-                    if (name == "profile.json") scene_dirty = true;
-                    continue;
-                }
                 if (ev->wd == wd_bl_) {
                     bl_dirty = true;
                     continue;
@@ -1539,11 +1578,19 @@ private:
                     Cluster& c = clusters_[i];
                     if (ev->wd == c.wd_up || ev->wd == c.wd_dn) {
                         if (ev->mask & (IN_DELETE_SELF | IN_IGNORED)) {
-                            if (ev->wd == c.wd_up) { c.wd_up = -1; c.wd_up_ino = 0; }
-                            if (ev->wd == c.wd_dn) { c.wd_dn = -1; c.wd_dn_ino = 0; }
+                            if (ev->wd == c.wd_up) { c.wd_up = -1; c.wd_up_ino = 0; c.wd_up_mask = 0; }
+                            if (ev->wd == c.wd_dn) { c.wd_dn = -1; c.wd_dn_ino = 0; c.wd_dn_mask = 0; }
                             need_rearm = true;
-                        } else if (!ignore_rate_echo) {
-                            rate_touched = true;
+                        } else {
+                            // Self chmod 0444 leaves is_path_shielded(p)==true so it never loops;
+                            // external chmod 0664 (e.g. scene-daemon) leaves it false and gets re-locked <1ms!
+                            if ((ev->mask & IN_ATTRIB) && mode_uses_shield(cfg_.mode) && now_m >= attrib_mute_until_ms_) {
+                                const std::string& p = (ev->wd == c.wd_up) ? c.up_path : c.dn_path;
+                                if (!p.empty() && !is_path_shielded(p)) attrib_unshielded = true;
+                            }
+                            if ((ev->mask & (IN_CLOSE_WRITE | IN_MODIFY)) && !ignore_rate_echo) {
+                                rate_touched = true;
+                            }
                         }
                     } else if (ev->wd == c.wd_gov) {
                         if (ev->mask & IN_IGNORED) c.wd_gov = -1;
@@ -1564,14 +1611,6 @@ private:
             reload_config_and_apply("config_change");
             return;
         }
-        if (scene_dirty && cfg_.mode == "scene" && cfg_.enabled && !is_recent_scene_self_write(now_m)) {
-            cached_schemes_ = parse_all_scene_schemes(paths_, clusters_);
-            if (sync_from_scene(true)) {
-                active_cfg_ = cfg_;
-                run_enforce(active_target_cfg(), "scene_change", false);
-                schedule_burst({400}, "scene_verify");
-            }
-        }
 
         std::vector<std::string> prev_govs;
         if (need_rearm) {
@@ -1588,7 +1627,29 @@ private:
             }
         }
         if (gov_event && cfg_.enabled) {
-            schedule_burst({150, 450}, "governor_restore");
+            // Re-lock 0444 immediately (<1ms) when kernel recreates sugov_ext/ at 0644
+            if (mode_uses_shield(cfg_.mode)) {
+                sync_shields_quiet(false);
+            }
+            schedule_burst({80, 350}, "governor_restore");
+        }
+
+        if (attrib_unshielded && cfg_.enabled && mode_uses_shield(cfg_.mode)) {
+            if (now_m - attrib_burst_window_ms_ > 2000) {
+                attrib_burst_window_ms_ = now_m;
+                attrib_burst_count_ = 1;
+            } else {
+                ++attrib_burst_count_;
+            }
+            if (attrib_burst_count_ > 24) {
+                attrib_mute_until_ms_ = now_m + 2000;
+                attrib_burst_count_ = 0;
+                schedule_burst({2050}, "shield_relock");
+            } else {
+                // Re-lock 0444 immediately (<1ms; CAP_DAC_OVERRIDE writers like scene-daemon still succeed!)
+                sync_shields_quiet(false);
+                schedule_burst({40}, "shield_relock");
+            }
         }
 
         if (bl_dirty && cfg_.watch_screen) {
@@ -1597,29 +1658,31 @@ private:
                 if (prev_bl_ > 0 && cur_bl == 0) {
                     prev_bl_ = 0;
                     last_screen_off_ms_ = now_m;
-                    if (cfg_.enabled) schedule_burst({700}, "screen_off");
+                    if (cfg_.enabled && !mode_uses_shield(cfg_.mode)) {
+                        schedule_burst({700}, "screen_off");
+                    }
                 } else if (prev_bl_ == 0 && cur_bl > 0) {
                     int64_t off_dur = (last_screen_off_ms_ > 0) ? (now_m - last_screen_off_ms_) : 999999;
                     prev_bl_ = cur_bl;
                     rm_watch(wd_bl_);
-                    bl_rearm_block_until_ms_ = now_m + 1800;
-                    schedule_burst({1850}, "bl_rearm");
-                    if (cfg_.enabled && off_dur >= 1500) {
-                        schedule_burst({1200}, "screen_on");
+                    bl_rearm_block_until_ms_ = now_m + 8000;
+                    schedule_burst({8050}, "bl_rearm");
+                    if (cfg_.enabled && off_dur >= 2000) {
+                        schedule_burst({1000}, "screen_on");
                     }
                 } else if (prev_bl_ > 0 && cur_bl > 0) {
+                    // Auto-brightness step while screen ON: back off 8s to avoid pointless wakeups
                     prev_bl_ = cur_bl;
                     rm_watch(wd_bl_);
-                    bl_rearm_block_until_ms_ = now_m + 2000;
-                    schedule_burst({2050}, "bl_rearm");
+                    bl_rearm_block_until_ms_ = now_m + 8000;
+                    schedule_burst({8050}, "bl_rearm");
                 } else {
                     prev_bl_ = cur_bl;
                 }
             }
         }
 
-        if (rate_touched && cfg_.enabled) {
-            // Group a multi-cluster 6-node write batch (~150ms) into a single burst count
+        if (rate_touched && cfg_.enabled && cfg_.mode != "shield") {
             if (now_m - last_rate_burst_hit_ms_ >= 350) {
                 last_rate_burst_hit_ms_ = now_m;
                 if (now_m - rate_burst_window_ms_ > 2500) {
@@ -1630,18 +1693,18 @@ private:
                 }
             }
 
-            if (cfg_.mode == "lock") {
-                if (rate_burst_count_ > 4) {
+            if (cfg_.mode == "override") {
+                if (rate_burst_count_ > 5) {
                     mute_rates_until_ms_ = now_m + 5000;
                     rate_burst_count_ = 0;
                     disarm_rate_watches();
                     schedule_burst({5050}, "rate_rearm");
-                    log_.write("lock high-frequency cooldown 5s");
+                    log_.write("override contention cooldown 5s");
                 } else {
                     schedule_rate_check(80);
                 }
             } else {
-                // smart / scene mode: absorb sustained boost storms by temporarily disarming rate watches
+                // compat mode: coalesce 220ms and absorb sustained boost storms
                 if (rate_burst_count_ > 3) {
                     mute_rates_until_ms_ = now_m + 2200;
                     rate_burst_count_ = 0;
@@ -1702,15 +1765,18 @@ private:
             }
 
             int64_t now_m = mono_ms();
+            bool shielded = mode_uses_shield(cfg_.mode);
             if (cfg_.watch_charger && unplugged) {
                 if (now_m - last_unplug_event_ms_ >= 2000) {
                     last_unplug_event_ms_ = now_m;
-                    schedule_burst({550, 2200}, "charger_unplug");
+                    if (shielded) schedule_burst({800}, "charger_unplug");
+                    else schedule_burst({550, 2200}, "charger_unplug");
                 }
             } else if (cfg_.watch_charger && plugged) {
                 if (now_m - last_plug_event_ms_ >= 2000) {
                     last_plug_event_ms_ = now_m;
-                    schedule_burst({650, 2200}, "charger_plug");
+                    if (shielded) schedule_burst({800}, "charger_plug");
+                    else schedule_burst({650, 2200}, "charger_plug");
                 }
             }
 
@@ -1720,7 +1786,7 @@ private:
                      (low_bat_last_reported_ - capacity >= 5));
                 if (crossed_low) {
                     low_bat_last_reported_ = capacity;
-                    schedule_burst({500}, "low_battery");
+                    schedule_burst({600}, "low_battery");
                 } else if (capacity > cfg_.low_bat_threshold) {
                     low_bat_last_reported_ = capacity;
                 }
@@ -1769,10 +1835,8 @@ private:
         }
         if (cfg_.enabled && !enforce_reason.empty()) {
             if (!do_bl_rearm && !do_rate_rearm) arm_watches();
-            if (cfg_.mode == "scene" && (enforce_reason == "rate_check" || enforce_reason == "rate_rearm")) {
-                if (maybe_latch_scene_scheme()) return;
-            }
-            run_enforce(active_target_cfg(), enforce_reason, false);
+            if (mode_uses_shield(cfg_.mode)) sync_shields_quiet(false);
+            run_enforce(cfg_, enforce_reason, false, true, cfg_.mode == "shield");
         }
     }
 
@@ -1795,15 +1859,15 @@ private:
     }
 
 private:
-    Config active_cfg_;
-    SceneAllSchemes cached_schemes_;
     int64_t bl_rearm_block_until_ms_ = 0;
     int64_t last_unplug_event_ms_ = 0;
     int64_t last_plug_event_ms_ = 0;
     int64_t last_screen_off_ms_ = 0;
-    int64_t suppress_scene_watch_until_ms_ = 0;
     int64_t mute_rates_until_ms_ = 0;
     int64_t suppress_rate_until_ms_ = 0;
+    int64_t attrib_burst_window_ms_ = 0;
+    int64_t attrib_mute_until_ms_ = 0;
+    int attrib_burst_count_ = 0;
     int64_t rate_check_first_ms_ = 0;
     int64_t rate_burst_window_ms_ = 0;
     int64_t last_rate_burst_hit_ms_ = 0;
@@ -1837,12 +1901,23 @@ void print_status_json(const Paths& paths) {
     pid_t dpid = 0;
     bool running = is_daemon_running(paths, &dpid);
 
+    int active_rate_clusters = 0;
+    int shielded_clusters = 0;
+    for (const auto& c : clusters) {
+        if (is_governor_rate_active(c.governor) && !c.up_path.empty() && !c.dn_path.empty()) {
+            ++active_rate_clusters;
+            if (is_path_shielded(c.up_path) && is_path_shielded(c.dn_path)) ++shielded_clusters;
+        }
+    }
+    bool shield_active = (active_rate_clusters > 0 && shielded_clusters == active_rate_clusters);
+
     std::ostringstream oss;
     oss << "{\"ok\":true"
         << ",\"enabled\":" << (cfg.enabled ? "true" : "false")
         << ",\"daemon\":" << (running ? "true" : "false")
         << ",\"daemon_pid\":" << dpid
         << ",\"mode\":\"" << json_escape(cfg.mode) << "\""
+        << ",\"shield_active\":" << (shield_active ? "true" : "false")
         << ",\"low_bat_threshold\":" << cfg.low_bat_threshold
         << ",\"watch_charger\":" << (cfg.watch_charger ? "true" : "false")
         << ",\"watch_screen\":" << (cfg.watch_screen ? "true" : "false")
@@ -1867,6 +1942,9 @@ void print_status_json(const Paths& paths) {
         uint64_t cur_up = 0, cur_dn = 0;
         bool has_up = !c.up_path.empty() && read_uint(c.up_path, cur_up);
         bool has_dn = !c.dn_path.empty() && read_uint(c.dn_path, cur_dn);
+        bool c_shield = !c.up_path.empty() && !c.dn_path.empty() &&
+                        is_path_shielded(c.up_path) && is_path_shielded(c.dn_path);
+        std::string nmode = !c.up_path.empty() ? format_path_mode(c.up_path) : "";
         if (i > 0) oss << ",";
         oss << "{\"index\":" << c.index
             << ",\"policy\":\"" << json_escape(c.policy_name) << "\""
@@ -1874,6 +1952,8 @@ void print_status_json(const Paths& paths) {
             << ",\"max_khz\":" << c.max_khz
             << ",\"governor\":\"" << json_escape(c.governor) << "\""
             << ",\"rate_dir\":\"" << json_escape(c.rate_dir) << "\""
+            << ",\"shielded\":" << (c_shield ? "true" : "false")
+            << ",\"node_mode\":\"" << json_escape(nmode) << "\""
             << ",\"cur_up\":" << (has_up ? std::to_string(cur_up) : "null")
             << ",\"cur_dn\":" << (has_dn ? std::to_string(cur_dn) : "null")
             << ",\"want_up\":" << cfg.up[i]
@@ -1951,7 +2031,8 @@ int cmd_apply(const Paths& paths, int argc, char** argv) {
         log.write("sync default -> Scene [" + synced_out + "]");
     }
 
-    bool ok = enforce_clusters(cfg, clusters, st, log, "webui_apply", true, false);
+    bool ok = enforce_clusters(cfg, clusters, st, log, "webui_apply", true, false, false);
+    sync_all_shields(cfg, clusters);
     save_state(paths, st);
     notify_daemon(paths);
     if (!ok) {
@@ -1983,11 +2064,12 @@ int cmd_set_config(const Paths& paths, const std::string& key, const std::string
         std::printf("{\"ok\":false,\"error\":\"save_failed\"}\n");
         return 1;
     }
+    sync_all_shields(cfg, clusters);
     if (cfg.enabled) {
         State st;
         load_state(paths, st);
         Logger log{paths.log_file};
-        enforce_clusters(cfg, clusters, st, log, "set_" + key, false);
+        enforce_clusters(cfg, clusters, st, log, "set_" + key, false, false, cfg.mode == "shield");
         save_state(paths, st);
     }
     notify_daemon(paths);
@@ -2016,7 +2098,8 @@ int cmd_sync_scene(const Paths& paths, const std::string& scheme) {
     State st;
     load_state(paths, st);
     Logger log{paths.log_file};
-    enforce_clusters(cfg, clusters, st, log, "sync_" + (pref ? std::string(pref) : std::string("scene")), true, false);
+    enforce_clusters(cfg, clusters, st, log, "sync_" + (pref ? std::string(pref) : std::string("scene")), true, false, false);
+    sync_all_shields(cfg, clusters);
     save_state(paths, st);
     notify_daemon(paths);
     print_status_json(paths);
