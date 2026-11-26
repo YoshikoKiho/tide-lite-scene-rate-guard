@@ -1,6 +1,6 @@
 id=chaoxi
 name=潮汐
-version=v1.2.0
-versionCode=120
+version=v1.3.0
+versionCode=130
 author=Tide
-description=事件驱动的 CPU 三簇速率守护模块，支持独立调控 Up/Down Rate Limit，在拔充、低电、亮屏唤醒与配置变更时瞬时恢复参数不被系统覆盖，零轮询极低功耗，内置莫奈取色 WebUI。
+description=内核级权限隔离与事件驱动 CPU 多簇速率守护模块，支持独立非对称调控 Up/Down Rate Limit，0444 VFS 护盾从源头零唤醒屏蔽系统 10us 重置，提供潮汐独占、Scene 分档护盾与兼容提频三档清晰模式，内置莫奈取色 WebUI。
